@@ -19,9 +19,10 @@ import secrets
 import string
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from audit_log import audit_log
 from store import store
 
 router = APIRouter(prefix="/v1", tags=["api-keys"])
@@ -45,6 +46,15 @@ class CreateApiKeyRequest(BaseModel):
         default=None,
         description="Hard cap on total spend for this key, in USD. Null = unlimited.",
     )
+
+
+def _actor(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    # Use everything up to and including the second dash segment as the actor.
+    # e.g. psk-prodChat01-<secret> -> psk-prodChat01-
+    parts = token.split("-", 2)
+    return f"{parts[0]}-{parts[1]}-" if len(parts) >= 2 else token
 
 
 def _now() -> str:
@@ -82,7 +92,7 @@ async def list_api_keys(include_revoked: bool = Query(True)):
 
 
 @router.post("/api-keys", status_code=201)
-async def create_api_key(req: CreateApiKeyRequest):
+async def create_api_key(req: CreateApiKeyRequest, request: Request):
     bad = [s for s in req.scopes if s not in VALID_SCOPES]
     if bad:
         raise HTTPException(
@@ -109,12 +119,21 @@ async def create_api_key(req: CreateApiKeyRequest):
         "revoked_at": None,
     }
     store.add_api_key(record)
+    audit_log.add_entry(
+        actor=_actor(request),
+        action="api_key.created",
+        resource_id=record["id"],
+        before=None,
+        after={k: v for k, v in record.items() if k != "secret"},
+        ip=request.client.host if request.client else "unknown",
+        user_agent=request.headers.get("user-agent", "unknown"),
+    )
     # The full secret is only returned at creation time.
     return {**record, "secret": full}
 
 
 @router.delete("/api-keys/{key_id}")
-async def revoke_api_key(key_id: str):
+async def revoke_api_key(key_id: str, request: Request):
     existing = store.get_api_key(key_id)
     if not existing:
         raise HTTPException(
@@ -123,7 +142,17 @@ async def revoke_api_key(key_id: str):
         )
     if existing.get("revoked_at"):
         return existing
-    return store.update_api_key(key_id, {"revoked_at": _now()})
+    updated = store.update_api_key(key_id, {"revoked_at": _now()})
+    audit_log.add_entry(
+        actor=_actor(request),
+        action="api_key.revoked",
+        resource_id=key_id,
+        before=existing,
+        after=updated,
+        ip=request.client.host if request.client else "unknown",
+        user_agent=request.headers.get("user-agent", "unknown"),
+    )
+    return updated
 
 
 class UpdateApiKeyRequest(BaseModel):
@@ -133,7 +162,7 @@ class UpdateApiKeyRequest(BaseModel):
 
 
 @router.patch("/api-keys/{key_id}")
-async def update_api_key(key_id: str, req: UpdateApiKeyRequest):
+async def update_api_key(key_id: str, req: UpdateApiKeyRequest, request: Request):
     existing = store.get_api_key(key_id)
     if not existing:
         raise HTTPException(
@@ -160,4 +189,14 @@ async def update_api_key(key_id: str, req: UpdateApiKeyRequest):
         patch["scopes"] = req.scopes
     if not patch:
         return existing
-    return store.update_api_key(key_id, patch)
+    updated = store.update_api_key(key_id, patch)
+    audit_log.add_entry(
+        actor=_actor(request),
+        action="api_key.updated",
+        resource_id=key_id,
+        before=existing,
+        after=updated,
+        ip=request.client.host if request.client else "unknown",
+        user_agent=request.headers.get("user-agent", "unknown"),
+    )
+    return updated

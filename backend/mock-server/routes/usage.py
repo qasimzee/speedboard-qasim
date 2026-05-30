@@ -12,9 +12,10 @@ import random
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from audit_log import audit_log
 from store import store
 
 router = APIRouter(prefix="/v1", tags=["usage"])
@@ -172,8 +173,15 @@ class SpendLimitRequest(BaseModel):
     )
 
 
+def _actor(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    parts = token.split("-", 2)
+    return f"{parts[0]}-{parts[1]}-" if len(parts) >= 2 else token
+
+
 @router.post("/spend-limits", status_code=201)
-async def create_spend_limit(req: SpendLimitRequest):
+async def create_spend_limit(req: SpendLimitRequest, request: Request):
     if req.scope == "api_key" and not req.api_key_id:
         raise HTTPException(
             status_code=400,
@@ -200,7 +208,7 @@ async def create_spend_limit(req: SpendLimitRequest):
             req.api_key_id,  # type: ignore[arg-type]
             {"spend_limit_usd": req.monthly_limit_usd},
         )
-    return {
+    result = {
         "id": "lim_" + hashlib.md5(req.model_dump_json().encode()).hexdigest()[:24],
         "scope": req.scope,
         "api_key_id": req.api_key_id,
@@ -208,3 +216,13 @@ async def create_spend_limit(req: SpendLimitRequest):
         "alert_thresholds_pct": req.alert_thresholds_pct,
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
+    audit_log.add_entry(
+        actor=_actor(request),
+        action="spend_limit.set",
+        resource_id=req.api_key_id or "account",
+        before=None,
+        after=result,
+        ip=request.client.host if request.client else "unknown",
+        user_agent=request.headers.get("user-agent", "unknown"),
+    )
+    return result

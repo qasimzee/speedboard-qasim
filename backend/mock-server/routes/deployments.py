@@ -15,10 +15,11 @@ import secrets
 import string
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from audit_log import audit_log
 from store import store
 
 router = APIRouter(prefix="/v1", tags=["deployments"])
@@ -76,8 +77,15 @@ async def list_deployments():
     return {"object": "list", "data": store.deployments()}
 
 
+def _actor(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    parts = token.split("-", 2)
+    return f"{parts[0]}-{parts[1]}-" if len(parts) >= 2 else token
+
+
 @router.post("/deployments", status_code=201)
-async def create_deployment(req: CreateDeploymentRequest):
+async def create_deployment(req: CreateDeploymentRequest, request: Request):
     if req.gpu_type not in VALID_GPU_IDS():
         raise HTTPException(
             status_code=400,
@@ -126,6 +134,15 @@ async def create_deployment(req: CreateDeploymentRequest):
         "updated_at": _now(),
     }
     store.add_deployment(record)
+    audit_log.add_entry(
+        actor=_actor(request),
+        action="deployment.created",
+        resource_id=dep_id,
+        before=None,
+        after=record,
+        ip=request.client.host if request.client else "unknown",
+        user_agent=request.headers.get("user-agent", "unknown"),
+    )
     return record
 
 
@@ -151,7 +168,7 @@ async def get_deployment(dep_id: str):
 
 
 @router.delete("/deployments/{dep_id}")
-async def delete_deployment(dep_id: str):
+async def delete_deployment(dep_id: str, request: Request):
     existing = store.get_deployment(dep_id)
     if not existing:
         raise HTTPException(
@@ -160,6 +177,15 @@ async def delete_deployment(dep_id: str):
         )
     store.update_deployment(
         dep_id, {"status": "deleted", "updated_at": _now(), "endpoint_url": None}
+    )
+    audit_log.add_entry(
+        actor=_actor(request),
+        action="deployment.deleted",
+        resource_id=dep_id,
+        before=existing,
+        after={"status": "deleted"},
+        ip=request.client.host if request.client else "unknown",
+        user_agent=request.headers.get("user-agent", "unknown"),
     )
     return {"id": dep_id, "deleted": True}
 

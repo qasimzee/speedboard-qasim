@@ -21,10 +21,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 
 from auth import auth_middleware
-from routes import api_keys, chat, deployments, gpu_types, models, usage
+from routes import api_keys, audits, chat, deployments, gpu_types, models, usage
 
 LATENCY_MIN_MS = int(os.getenv("MOCK_LATENCY_MIN_MS", "50"))
 LATENCY_MAX_MS = int(os.getenv("MOCK_LATENCY_MAX_MS", "300"))
@@ -49,7 +50,33 @@ app = FastAPI(
         "Parasail API. See /docs for interactive Swagger UI."
     ),
     lifespan=lifespan,
+    swagger_ui_parameters={"persistAuthorization": True},
 )
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema.setdefault("components", {})
+    schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "description": "Use `psk-mock-mockkey` for local development",
+        }
+    }
+    schema["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
 
 app.add_middleware(
     CORSMiddleware,
@@ -111,3 +138,4 @@ app.include_router(api_keys.router)
 app.include_router(usage.router)
 app.include_router(gpu_types.router)
 app.include_router(deployments.router)
+app.include_router(audits.router)
